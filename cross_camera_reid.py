@@ -59,6 +59,8 @@ ATTR_HARD_FILTER = True
 ATTR_HARD_CONF = 0.60
 ATTR_HARD_MARGIN = 0.25
 ATTR_WEIGHT = 0.20
+SHAPE_ENABLED = True
+SHAPE_WEIGHT = 0.10
 ATTRIBUTES = [
     "backpack",
     "hat",
@@ -446,6 +448,39 @@ class AttributeStore:
             self.buffers.pop(k, None)
 
 
+class ShapeStore:
+    """track별 shape feature buffer를 유지하고 평균 shape을 반환."""
+
+    def __init__(self, max_features: int = MAX_FEATURES_PER_TRACK):
+        self.max_features = max_features
+        self.buffers: Dict[Union[int, str], Deque[np.ndarray]] = defaultdict(lambda: deque(maxlen=max_features))
+        self.last_seen: Dict[Union[int, str], int] = {}
+
+    def update(self, key: Union[int, str], shape: np.ndarray, frame_idx: int):
+        self.buffers[key].append(shape.astype(np.float32))
+        self.last_seen[key] = frame_idx
+
+    def get_mean(self, key: Union[int, str]) -> Optional[np.ndarray]:
+        buf = self.buffers.get(key)
+        if not buf:
+            return None
+        mean_shape = np.mean(np.stack(list(buf), axis=0), axis=0)
+        return mean_shape.astype(np.float32)
+
+    def count(self, key: Union[int, str]) -> int:
+        buf = self.buffers.get(key)
+        return len(buf) if buf else 0
+
+    def keys(self):
+        return list(self.buffers.keys())
+
+    def expire(self, frame_idx: int, max_age: int):
+        expired = [k for k, last in self.last_seen.items() if frame_idx - last > max_age]
+        for k in expired:
+            self.last_seen.pop(k, None)
+            self.buffers.pop(k, None)
+
+
 # ── Gallery / Global ID manager ───────────────────────────────────────────────
 def cosine_similarity_np(a: np.ndarray, b: np.ndarray) -> float:
     """L2-normalized vector 기준 cosine similarity."""
@@ -505,6 +540,25 @@ def attribute_confident_mismatch(
     return False
 
 
+def shape_from_bbox(frame_w: int, frame_h: int, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
+    bw = max(1.0, float(x2 - x1))
+    bh = max(1.0, float(y2 - y1))
+    aspect = bw / bh
+    rel_h = bh / max(1.0, float(frame_h))
+    return np.asarray([aspect, rel_h], dtype=np.float32)
+
+
+def shape_similarity(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
+    if a is None or b is None:
+        return None
+    if a.shape != b.shape:
+        return None
+    diff = np.abs(a - b)
+    scales = np.asarray([0.6, 0.4], dtype=np.float32)
+    diff = np.minimum(diff / scales, 1.0)
+    return float(1.0 - np.mean(diff))
+
+
 class Gallery:
     """
     Camera A/B local track을 Global ID memory에 연결한다.
@@ -532,6 +586,8 @@ class Gallery:
         attr_hard_filter: bool = ATTR_HARD_FILTER,
         attr_hard_conf: float = ATTR_HARD_CONF,
         attr_hard_margin: float = ATTR_HARD_MARGIN,
+        shape_weight: float = SHAPE_WEIGHT,
+        shape_enabled: bool = SHAPE_ENABLED,
         evidence_decay: float = EVIDENCE_DECAY,
         min_evidence: float = MIN_EVIDENCE,
         evidence_margin: float = EVIDENCE_MARGIN,
@@ -557,6 +613,9 @@ class Gallery:
         self.attr_hard_conf = float(attr_hard_conf)
         self.attr_hard_margin = float(attr_hard_margin)
 
+        self.shape_weight = float(max(0.0, min(1.0, shape_weight)))
+        self.shape_enabled = bool(shape_enabled)
+
         self.evidence_decay = float(evidence_decay)
         self.min_evidence = float(min_evidence)
         self.evidence_margin = float(evidence_margin)
@@ -571,12 +630,17 @@ class Gallery:
         self.attr_a = AttributeStore(max_features=max_features)
         self.attr_b = AttributeStore(max_features=max_features)
 
+        # local track별 shape buffer
+        self.shape_a = ShapeStore(max_features=max_features)
+        self.shape_b = ShapeStore(max_features=max_features)
+
         # Global ID별 feature archive. local track이 사라져도 이 memory는 일정 시간 유지된다.
         self.store_gid = TrackFeatureStore(max_features=max_features * 2)
         self.gid_last_seen: Dict[int, int] = {}
         self.gid_last_cam: Dict[int, str] = {}
 
         self.attr_gid = AttributeStore(max_features=max_features * 2)
+        self.shape_gid = ShapeStore(max_features=max_features * 2)
 
         self.a_gid: Dict[int, int] = {}
         self.b_current_gid: Dict[int, int] = {}   # 현재 evidence상 가장 그럴듯한 global GID 또는 TMP 음수 ID
@@ -602,12 +666,22 @@ class Gallery:
             self.b_temp_gid[local_id] = -(local_id + 1)
         return self.b_temp_gid[local_id]
 
-    def _update_gid_memory(self, gid: int, feat: np.ndarray, frame_idx: int, cam: str, attrs: Optional[np.ndarray] = None):
+    def _update_gid_memory(
+        self,
+        gid: int,
+        feat: np.ndarray,
+        frame_idx: int,
+        cam: str,
+        attrs: Optional[np.ndarray] = None,
+        shape: Optional[np.ndarray] = None,
+    ):
         if gid is None or gid < 0:
             return
         self.store_gid.update(gid, feat, frame_idx)
         if attrs is not None:
             self.attr_gid.update(gid, attrs, frame_idx)
+        if shape is not None:
+            self.shape_gid.update(gid, shape, frame_idx)
         self.gid_last_seen[gid] = frame_idx
         self.gid_last_cam[gid] = cam
 
@@ -619,6 +693,8 @@ class Gallery:
         feats_b: List[np.ndarray],
         attr_a: Optional[np.ndarray],
         attr_b: Optional[np.ndarray],
+        shape_a: Optional[np.ndarray],
+        shape_b: Optional[np.ndarray],
     ) -> Optional[float]:
         """두 feature set의 weighted cosine distance를 계산한다."""
         if mean_a is None or mean_b is None:
@@ -636,10 +712,13 @@ class Gallery:
         else:
             attr_sim = None
 
-        if attr_sim is None:
-            final_sim = osnet_sim
-        else:
-            final_sim = (1.0 - self.attr_weight) * osnet_sim + self.attr_weight * attr_sim
+        final_sim = osnet_sim
+        if attr_sim is not None:
+            final_sim = (1.0 - self.attr_weight) * final_sim + self.attr_weight * attr_sim
+
+        shape_sim = shape_similarity(shape_a, shape_b) if self.shape_enabled else None
+        if shape_sim is not None:
+            final_sim = (1.0 - self.shape_weight) * final_sim + self.shape_weight * shape_sim
         return float(1.0 - final_sim)
 
     def _track_to_gid_distance(self, store: TrackFeatureStore, lid: int, gid: int) -> Optional[float]:
@@ -650,6 +729,8 @@ class Gallery:
             self.store_gid.get_features(gid),
             self.attr_a.get_mean(lid) if store is self.store_a else self.attr_b.get_mean(lid),
             self.attr_gid.get_mean(gid),
+            self.shape_a.get_mean(lid) if store is self.store_a else self.shape_b.get_mean(lid),
+            self.shape_gid.get_mean(gid),
         )
 
     def _rank_gid_candidates(
@@ -740,7 +821,14 @@ class Gallery:
             return best_gid
         return None
 
-    def update_cam_a(self, local_id: int, feat: np.ndarray, frame_idx: int, attrs: Optional[np.ndarray] = None) -> int:
+    def update_cam_a(
+        self,
+        local_id: int,
+        feat: np.ndarray,
+        frame_idx: int,
+        attrs: Optional[np.ndarray] = None,
+        shape: Optional[np.ndarray] = None,
+    ) -> int:
         """
         Camera A local track update.
         v7에서는 새 local ID가 등장해도 바로 새 GID를 만들지 않고, 기존 Global ID memory와 먼저 비교한다.
@@ -748,6 +836,8 @@ class Gallery:
         self.store_a.update(local_id, feat, frame_idx)
         if attrs is not None:
             self.attr_a.update(local_id, attrs, frame_idx)
+        if shape is not None:
+            self.shape_a.update(local_id, shape, frame_idx)
 
         if local_id in self.a_gid:
             gid = self.a_gid[local_id]
@@ -758,7 +848,7 @@ class Gallery:
             self.a_gid[local_id] = gid
             self.gid_owner_a[gid] = local_id
 
-        self._update_gid_memory(gid, feat, frame_idx, "A", attrs=attrs)
+        self._update_gid_memory(gid, feat, frame_idx, "A", attrs=attrs, shape=shape)
         return gid
 
     def _update_current_assignment(self, b_lid: int, latest_best_gid: Optional[int] = None):
@@ -794,7 +884,14 @@ class Gallery:
 
         self._try_assign_gid(b_lid, best_gid)
 
-    def update_cam_b_and_match(self, local_id: int, feat: np.ndarray, frame_idx: int, attrs: Optional[np.ndarray] = None) -> Tuple[int, Optional[float]]:
+    def update_cam_b_and_match(
+        self,
+        local_id: int,
+        feat: np.ndarray,
+        frame_idx: int,
+        attrs: Optional[np.ndarray] = None,
+        shape: Optional[np.ndarray] = None,
+    ) -> Tuple[int, Optional[float]]:
         """
         Camera B local track update and match against Global ID memory.
         새 B local ID는 바로 새 양수 GID를 만들지 않고 TMP로 시작한다.
@@ -803,6 +900,8 @@ class Gallery:
         self.store_b.update(local_id, feat, frame_idx)
         if attrs is not None:
             self.attr_b.update(local_id, attrs, frame_idx)
+        if shape is not None:
+            self.shape_b.update(local_id, shape, frame_idx)
         self._decay_evidence(local_id)
 
         if self.store_b.count(local_id) < self.min_features_to_match:
@@ -832,7 +931,7 @@ class Gallery:
         # 너무 이른 오매칭 feature가 archive를 오염시키는 것을 막기 위한 조건이다.
         if gid is not None and gid >= 0:
             if self.b_hits[local_id].get(gid, 0) >= self.confirm_count and self.b_evidence[local_id].get(gid, 0.0) >= self.min_evidence:
-                self._update_gid_memory(gid, feat, frame_idx, "B", attrs=attrs)
+                self._update_gid_memory(gid, feat, frame_idx, "B", attrs=attrs, shape=shape)
 
         return gid, best_dist
 
@@ -849,6 +948,9 @@ class Gallery:
         self.attr_a.expire(frame_idx, self.max_age)
         self.attr_b.expire(frame_idx, self.max_age)
         self.attr_gid.expire(frame_idx, self.memory_max_age)
+        self.shape_a.expire(frame_idx, self.max_age)
+        self.shape_b.expire(frame_idx, self.max_age)
+        self.shape_gid.expire(frame_idx, self.memory_max_age)
 
         valid_a = set(self.store_a.keys())
         valid_b = set(self.store_b.keys())
@@ -1303,8 +1405,9 @@ def run(
                     if crop is not None:
                         feat = extractor.extract(crop)
                         attrs = attr_extractor.extract(crop) if attr_extractor is not None else None
+                        shape = shape_from_bbox(orig_w_a, orig_h_a, x1, y1, x2, y2)
                         if feat is not None:
-                            gid = gallery.update_cam_a(lid, feat, frame_idx, attrs=attrs)
+                            gid = gallery.update_cam_a(lid, feat, frame_idx, attrs=attrs, shape=shape)
                         else:
                             gid = gallery.get_gid(lid, "A")
                     else:
@@ -1327,8 +1430,9 @@ def run(
                     if crop is not None:
                         feat = extractor.extract(crop)
                         attrs = attr_extractor.extract(crop) if attr_extractor is not None else None
+                        shape = shape_from_bbox(orig_w_b, orig_h_b, x1, y1, x2, y2)
                         if feat is not None:
-                            gid, _best_dist = gallery.update_cam_b_and_match(lid, feat, frame_idx, attrs=attrs)
+                            gid, _best_dist = gallery.update_cam_b_and_match(lid, feat, frame_idx, attrs=attrs, shape=shape)
                         else:
                             gid = gallery.get_gid(lid, "B")
                     else:
