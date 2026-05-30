@@ -45,7 +45,7 @@ from ultralytics import YOLO
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
 YOLO_MODEL = "yolo11m.pt"  # v10 안정형 기본값. 더 강하게는 yolo11l.pt / yolo11x.pt
-OSNET_MODEL = "osnet_x1_5"
+OSNET_MODEL = "osnet_ain_x1_0"
 OSNET_WEIGHTS = "market1501"  # Re-ID pretrained weights
 OSNET_HF_REPO = "MYerassyl/retail-heat-osnet"
 OSNET_HF_FILENAMES = {
@@ -62,7 +62,7 @@ ATTR_MODEL_PRETRAINED = "openai"
 ATTR_HARD_FILTER = True
 ATTR_HARD_CONF = 0.60
 ATTR_HARD_MARGIN = 0.25
-ATTR_WEIGHT = 0.20
+ATTR_WEIGHT = 0.25
 ATTRIBUTES = [
     "backpack",
     "hat",
