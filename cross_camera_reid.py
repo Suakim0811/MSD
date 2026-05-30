@@ -45,10 +45,14 @@ from ultralytics import YOLO
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
 YOLO_MODEL = "yolo11m.pt"  # v10 안정형 기본값. 더 강하게는 yolo11l.pt / yolo11x.pt
-OSNET_MODEL = "osnet_x1_0"
+OSNET_MODEL = "osnet_x1_5"
 OSNET_WEIGHTS = "market1501"  # Re-ID pretrained weights
 OSNET_HF_REPO = "MYerassyl/retail-heat-osnet"
-OSNET_HF_FILENAME = "osnet_x1_0_market1501.pth"
+OSNET_HF_FILENAMES = {
+    ("osnet_x1_0", "market1501"): "osnet_x1_0_market1501.pth",
+    ("osnet_x1_5", "market1501"): "osnet_x1_5_market1501.pth",
+    ("osnet_x2_0", "market1501"): "osnet_x2_0_market1501.pth",
+}
 PERSON_CLASS = 0
 
 # Attribute extraction (CLIP)
@@ -136,6 +140,11 @@ MAX_ASPECT_RATIO = 1.20                  # bbox width/height 최대 비율. 너�
 GLOBAL_MEMORY_MAX_AGE = 900             # 사라진 GID를 archive에 유지할 프레임 수
 REASSOC_DISTANCE_MARGIN = 0.02          # 새 local track을 기존 GID와 재연결할 때 best/second distance 차이 조건
 
+# camera-wise feature normalization (view gap mitigation)
+CAM_NORM_ENABLED = True
+CAM_NORM_MIN_COUNT = 30
+CAM_NORM_EPS = 1e-6
+
 # ── 색상 팔레트 ───────────────────────────────────────────────────────────────
 PALETTE = [
     (220, 80, 80), (80, 180, 80), (80, 120, 220),
@@ -156,7 +165,59 @@ def l2_normalize(feat: np.ndarray) -> np.ndarray:
     return feat / norm
 
 
+class RunningStats:
+    def __init__(self, eps: float = CAM_NORM_EPS):
+        self.count = 0
+        self.mean: Optional[np.ndarray] = None
+        self.m2: Optional[np.ndarray] = None
+        self.eps = float(eps)
+
+    def update(self, x: np.ndarray):
+        x = x.astype(np.float32)
+        if self.mean is None:
+            self.mean = x.copy()
+            self.m2 = np.zeros_like(x, dtype=np.float32)
+            self.count = 1
+            return
+
+        self.count += 1
+        delta = x - self.mean
+        self.mean += delta / float(self.count)
+        delta2 = x - self.mean
+        self.m2 += delta * delta2
+
+    def std(self) -> Optional[np.ndarray]:
+        if self.count < 2 or self.m2 is None:
+            return None
+        var = self.m2 / float(max(1, self.count - 1))
+        return np.sqrt(np.maximum(var, self.eps))
+
+
+class CameraFeatureNormalizer:
+    def __init__(self, min_count: int = CAM_NORM_MIN_COUNT, eps: float = CAM_NORM_EPS):
+        self.stats = RunningStats(eps=eps)
+        self.min_count = int(min_count)
+
+    def normalize(self, feat: np.ndarray, update: bool = True) -> np.ndarray:
+        if update:
+            self.stats.update(feat)
+        if self.stats.count < self.min_count:
+            return feat
+        std = self.stats.std()
+        if std is None:
+            return feat
+        centered = (feat - self.stats.mean) / std
+        return l2_normalize(centered.astype(np.float32))
+
+
 # ── OSNet feature extractor ──────────────────────────────────────────────────
+def resolve_osnet_hf_filename(model_name: str, weights: str) -> str:
+    filename = OSNET_HF_FILENAMES.get((model_name, weights))
+    if filename:
+        return filename
+    return OSNET_HF_FILENAMES.get((OSNET_MODEL, OSNET_WEIGHTS), "")
+
+
 class OSNetExtractor:
     """Torchreid OSNet으로 person crop → L2-normalized Re-ID feature."""
 
@@ -181,9 +242,12 @@ class OSNetExtractor:
         model_path = ""
         try:
             from huggingface_hub import hf_hub_download
+            hf_filename = resolve_osnet_hf_filename(model_name, weights)
+            if not hf_filename:
+                raise ValueError("No HuggingFace filename mapping for OSNet model/weights.")
             model_path = hf_hub_download(
                 repo_id=OSNET_HF_REPO,
-                filename=OSNET_HF_FILENAME,
+                filename=hf_filename,
             )
             print(f"[INFO] OSNet Re-ID weights : {model_path}")
         except Exception as e:
@@ -1184,6 +1248,7 @@ def run(
     attr_hard_margin: float = ATTR_HARD_MARGIN,
     attr_model_name: str = ATTR_MODEL_NAME,
     attr_model_pretrained: str = ATTR_MODEL_PRETRAINED,
+    osnet_model: str = OSNET_MODEL,
 ):
     global MATCH_THRESHOLD
 
@@ -1205,14 +1270,18 @@ def run(
     print(f"[INFO] Evidence : confirm={confirm_count}, decay={evidence_decay}, min={min_evidence}, ev_margin={evidence_margin}, switch_margin={switch_margin}, dist_margin={distance_margin}")
     print(f"[INFO] Occlusion-aware update : {'ON' if skip_occluded_update else 'OFF'}, occ_iou={occ_iou}, edge_margin={edge_margin}, aspect=[{min_aspect}, {max_aspect}]")
     print(f"[INFO] GID archive : memory_max_age={memory_max_age}, reassoc_margin={reassoc_margin}")
+    print(f"[INFO] Camera norm : {'ON' if CAM_NORM_ENABLED else 'OFF'}, min_count={CAM_NORM_MIN_COUNT}")
     print(f"[INFO] Display window : {'ON' if show else 'OFF'}")
 
     print("[INFO] Loading YOLO + ByteTrack ...")
     tracker_a = Tracker(yolo_model, imgsz=imgsz, conf=yolo_conf, iou=yolo_iou, augment=yolo_augment, tracker_name=tracker_name)
     tracker_b = Tracker(yolo_model, imgsz=imgsz, conf=yolo_conf, iou=yolo_iou, augment=yolo_augment, tracker_name=tracker_name)
 
-    print("[INFO] Loading OSNet ...")
-    extractor = OSNetExtractor(OSNET_MODEL, OSNET_WEIGHTS, device)
+    print(f"[INFO] Loading OSNet ... model={osnet_model}, weights={OSNET_WEIGHTS}")
+    extractor = OSNetExtractor(osnet_model, OSNET_WEIGHTS, device)
+
+    norm_a = CameraFeatureNormalizer() if CAM_NORM_ENABLED else None
+    norm_b = CameraFeatureNormalizer() if CAM_NORM_ENABLED else None
 
     attr_extractor = None
     if attr_enabled:
@@ -1304,6 +1373,8 @@ def run(
                         feat = extractor.extract(crop)
                         attrs = attr_extractor.extract(crop) if attr_extractor is not None else None
                         if feat is not None:
+                            if norm_a is not None:
+                                feat = norm_a.normalize(feat, update=True)
                             gid = gallery.update_cam_a(lid, feat, frame_idx, attrs=attrs)
                         else:
                             gid = gallery.get_gid(lid, "A")
@@ -1328,6 +1399,8 @@ def run(
                         feat = extractor.extract(crop)
                         attrs = attr_extractor.extract(crop) if attr_extractor is not None else None
                         if feat is not None:
+                            if norm_b is not None:
+                                feat = norm_b.normalize(feat, update=True)
                             gid, _best_dist = gallery.update_cam_b_and_match(lid, feat, frame_idx, attrs=attrs)
                         else:
                             gid = gallery.get_gid(lid, "B")
@@ -1432,6 +1505,14 @@ if __name__ == "__main__":
     parser.add_argument("--attr_hard_margin", type=float, default=ATTR_HARD_MARGIN, help=f"attribute hard-filter 차이 margin (기본: {ATTR_HARD_MARGIN})")
     parser.add_argument("--attr_model", default=ATTR_MODEL_NAME, help=f"CLIP model name (기본: {ATTR_MODEL_NAME})")
     parser.add_argument("--attr_pretrained", default=ATTR_MODEL_PRETRAINED, help=f"CLIP pretrained tag (기본: {ATTR_MODEL_PRETRAINED})")
+    parser.add_argument(
+        "--osnet_model",
+        default=OSNET_MODEL,
+        help=(
+            f"OSNet model name (기본: {OSNET_MODEL}). "
+            "추천: osnet_x1_5, 더 무거움: osnet_x2_0"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1489,6 +1570,7 @@ if __name__ == "__main__":
                 attr_hard_margin=args.attr_hard_margin,
                 attr_model_name=args.attr_model,
                 attr_model_pretrained=args.attr_pretrained,
+                osnet_model=args.osnet_model,
             )
 
         print(f"\n[INFO] 전체 {len(pairs)}쌍 처리 완료.")
@@ -1529,4 +1611,5 @@ if __name__ == "__main__":
             attr_hard_margin=args.attr_hard_margin,
             attr_model_name=args.attr_model,
             attr_model_pretrained=args.attr_pretrained,
+            osnet_model=args.osnet_model,
         )
