@@ -71,6 +71,7 @@ ATTRIBUTES = [
     "upper_green",
     "upper_blue",
     "upper_purple",
+    "upper_pink",
     "upper_brown",
     "lower_black",
     "lower_white",
@@ -81,6 +82,7 @@ ATTRIBUTES = [
     "lower_green",
     "lower_blue",
     "lower_purple",
+    "lower_pink",
     "lower_brown",
     "backpack_black",
     "backpack_white",
@@ -91,6 +93,7 @@ ATTRIBUTES = [
     "backpack_green",
     "backpack_blue",
     "backpack_purple",
+    "backpack_pink",
     "backpack_brown",
 ]
 
@@ -256,6 +259,7 @@ class CLIPAttributeExtractor:
             "upper_green": ("person wearing green upper clothes", "person wearing non-green upper clothes"),
             "upper_blue": ("person wearing blue upper clothes", "person wearing non-blue upper clothes"),
             "upper_purple": ("person wearing purple upper clothes", "person wearing non-purple upper clothes"),
+            "upper_pink": ("person wearing pink upper clothes", "person wearing non-pink upper clothes"),
             "upper_brown": ("person wearing brown upper clothes", "person wearing non-brown upper clothes"),
             "lower_black": ("person wearing black lower clothes", "person wearing non-black lower clothes"),
             "lower_white": ("person wearing white lower clothes", "person wearing non-white lower clothes"),
@@ -266,6 +270,7 @@ class CLIPAttributeExtractor:
             "lower_green": ("person wearing green lower clothes", "person wearing non-green lower clothes"),
             "lower_blue": ("person wearing blue lower clothes", "person wearing non-blue lower clothes"),
             "lower_purple": ("person wearing purple lower clothes", "person wearing non-purple lower clothes"),
+            "lower_pink": ("person wearing pink lower clothes", "person wearing non-pink lower clothes"),
             "lower_brown": ("person wearing brown lower clothes", "person wearing non-brown lower clothes"),
             "backpack_black": ("person wearing a black backpack", "person wearing a non-black backpack"),
             "backpack_white": ("person wearing a white backpack", "person wearing a non-white backpack"),
@@ -276,6 +281,7 @@ class CLIPAttributeExtractor:
             "backpack_green": ("person wearing a green backpack", "person wearing a non-green backpack"),
             "backpack_blue": ("person wearing a blue backpack", "person wearing a non-blue backpack"),
             "backpack_purple": ("person wearing a purple backpack", "person wearing a non-purple backpack"),
+            "backpack_pink": ("person wearing a pink backpack", "person wearing a non-pink backpack"),
             "backpack_brown": ("person wearing a brown backpack", "person wearing a non-brown backpack"),
         }
 
