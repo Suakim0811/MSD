@@ -145,6 +145,14 @@ CAM_NORM_ENABLED = True
 CAM_NORM_MIN_COUNT = 30
 CAM_NORM_EPS = 1e-6
 
+# distance-ratio spatial signature (relative layout gating/weighting)
+DIST_RATIO_ENABLED = True
+DIST_RATIO_WEIGHT = 0.20
+DIST_RATIO_K = 3
+DIST_RATIO_MIN_NEIGHBORS = 2
+DIST_RATIO_SIGMA = 0.45
+DIST_RATIO_EPS = 1e-6
+
 # ── 색상 팔레트 ───────────────────────────────────────────────────────────────
 PALETTE = [
     (220, 80, 80), (80, 180, 80), (80, 120, 220),
@@ -510,6 +518,39 @@ class AttributeStore:
             self.buffers.pop(k, None)
 
 
+class SpatialSignatureStore:
+    """track별 상대 거리 비율 signature buffer를 유지하고 평균 signature를 반환."""
+
+    def __init__(self, max_features: int = MAX_FEATURES_PER_TRACK):
+        self.max_features = max_features
+        self.buffers: Dict[Union[int, str], Deque[np.ndarray]] = defaultdict(lambda: deque(maxlen=max_features))
+        self.last_seen: Dict[Union[int, str], int] = {}
+
+    def update(self, key: Union[int, str], sig: np.ndarray, frame_idx: int):
+        self.buffers[key].append(sig.astype(np.float32))
+        self.last_seen[key] = frame_idx
+
+    def get_mean(self, key: Union[int, str]) -> Optional[np.ndarray]:
+        buf = self.buffers.get(key)
+        if not buf:
+            return None
+        mean_sig = np.mean(np.stack(list(buf), axis=0), axis=0)
+        return mean_sig.astype(np.float32)
+
+    def count(self, key: Union[int, str]) -> int:
+        buf = self.buffers.get(key)
+        return len(buf) if buf else 0
+
+    def keys(self):
+        return list(self.buffers.keys())
+
+    def expire(self, frame_idx: int, max_age: int):
+        expired = [k for k, last in self.last_seen.items() if frame_idx - last > max_age]
+        for k in expired:
+            self.last_seen.pop(k, None)
+            self.buffers.pop(k, None)
+
+
 # ── Gallery / Global ID manager ───────────────────────────────────────────────
 def cosine_similarity_np(a: np.ndarray, b: np.ndarray) -> float:
     """L2-normalized vector 기준 cosine similarity."""
@@ -547,6 +588,19 @@ def attribute_similarity(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Op
     if a.shape != b.shape:
         return None
     return float(1.0 - np.mean(np.abs(a - b)))
+
+
+def distance_ratio_similarity(a: Optional[np.ndarray], b: Optional[np.ndarray], sigma: float = DIST_RATIO_SIGMA) -> Optional[float]:
+    if a is None or b is None:
+        return None
+    if a.ndim != 1 or b.ndim != 1:
+        return None
+    m = min(a.size, b.size)
+    if m <= 0:
+        return None
+    diff = float(np.mean(np.abs(a[:m] - b[:m])))
+    sigma = max(1e-6, float(sigma))
+    return float(np.exp(-diff / sigma))
 
 
 def attribute_confident_mismatch(
@@ -596,6 +650,9 @@ class Gallery:
         attr_hard_filter: bool = ATTR_HARD_FILTER,
         attr_hard_conf: float = ATTR_HARD_CONF,
         attr_hard_margin: float = ATTR_HARD_MARGIN,
+        dist_ratio_enabled: bool = DIST_RATIO_ENABLED,
+        dist_ratio_weight: float = DIST_RATIO_WEIGHT,
+        dist_ratio_sigma: float = DIST_RATIO_SIGMA,
         evidence_decay: float = EVIDENCE_DECAY,
         min_evidence: float = MIN_EVIDENCE,
         evidence_margin: float = EVIDENCE_MARGIN,
@@ -621,6 +678,10 @@ class Gallery:
         self.attr_hard_conf = float(attr_hard_conf)
         self.attr_hard_margin = float(attr_hard_margin)
 
+        self.dist_ratio_enabled = bool(dist_ratio_enabled)
+        self.dist_ratio_weight = float(max(0.0, min(1.0, dist_ratio_weight)))
+        self.dist_ratio_sigma = float(dist_ratio_sigma)
+
         self.evidence_decay = float(evidence_decay)
         self.min_evidence = float(min_evidence)
         self.evidence_margin = float(evidence_margin)
@@ -635,12 +696,16 @@ class Gallery:
         self.attr_a = AttributeStore(max_features=max_features)
         self.attr_b = AttributeStore(max_features=max_features)
 
+        self.spatial_a = SpatialSignatureStore(max_features=max_features)
+        self.spatial_b = SpatialSignatureStore(max_features=max_features)
+
         # Global ID별 feature archive. local track이 사라져도 이 memory는 일정 시간 유지된다.
         self.store_gid = TrackFeatureStore(max_features=max_features * 2)
         self.gid_last_seen: Dict[int, int] = {}
         self.gid_last_cam: Dict[int, str] = {}
 
         self.attr_gid = AttributeStore(max_features=max_features * 2)
+        self.spatial_gid = SpatialSignatureStore(max_features=max_features * 2)
 
         self.a_gid: Dict[int, int] = {}
         self.b_current_gid: Dict[int, int] = {}   # 현재 evidence상 가장 그럴듯한 global GID 또는 TMP 음수 ID
@@ -666,12 +731,22 @@ class Gallery:
             self.b_temp_gid[local_id] = -(local_id + 1)
         return self.b_temp_gid[local_id]
 
-    def _update_gid_memory(self, gid: int, feat: np.ndarray, frame_idx: int, cam: str, attrs: Optional[np.ndarray] = None):
+    def _update_gid_memory(
+        self,
+        gid: int,
+        feat: np.ndarray,
+        frame_idx: int,
+        cam: str,
+        attrs: Optional[np.ndarray] = None,
+        spatial_sig: Optional[np.ndarray] = None,
+    ):
         if gid is None or gid < 0:
             return
         self.store_gid.update(gid, feat, frame_idx)
         if attrs is not None:
             self.attr_gid.update(gid, attrs, frame_idx)
+        if spatial_sig is not None:
+            self.spatial_gid.update(gid, spatial_sig, frame_idx)
         self.gid_last_seen[gid] = frame_idx
         self.gid_last_cam[gid] = cam
 
@@ -683,6 +758,8 @@ class Gallery:
         feats_b: List[np.ndarray],
         attr_a: Optional[np.ndarray],
         attr_b: Optional[np.ndarray],
+        spatial_a: Optional[np.ndarray],
+        spatial_b: Optional[np.ndarray],
     ) -> Optional[float]:
         """두 feature set의 weighted cosine distance를 계산한다."""
         if mean_a is None or mean_b is None:
@@ -704,6 +781,11 @@ class Gallery:
             final_sim = osnet_sim
         else:
             final_sim = (1.0 - self.attr_weight) * osnet_sim + self.attr_weight * attr_sim
+
+        if self.dist_ratio_enabled:
+            spatial_sim = distance_ratio_similarity(spatial_a, spatial_b, sigma=self.dist_ratio_sigma)
+            if spatial_sim is not None and self.dist_ratio_weight > 0.0:
+                final_sim = (1.0 - self.dist_ratio_weight) * final_sim + self.dist_ratio_weight * spatial_sim
         return float(1.0 - final_sim)
 
     def _track_to_gid_distance(self, store: TrackFeatureStore, lid: int, gid: int) -> Optional[float]:
@@ -714,6 +796,8 @@ class Gallery:
             self.store_gid.get_features(gid),
             self.attr_a.get_mean(lid) if store is self.store_a else self.attr_b.get_mean(lid),
             self.attr_gid.get_mean(gid),
+            self.spatial_a.get_mean(lid) if store is self.store_a else self.spatial_b.get_mean(lid),
+            self.spatial_gid.get_mean(gid),
         )
 
     def _rank_gid_candidates(
@@ -804,7 +888,14 @@ class Gallery:
             return best_gid
         return None
 
-    def update_cam_a(self, local_id: int, feat: np.ndarray, frame_idx: int, attrs: Optional[np.ndarray] = None) -> int:
+    def update_cam_a(
+        self,
+        local_id: int,
+        feat: np.ndarray,
+        frame_idx: int,
+        attrs: Optional[np.ndarray] = None,
+        spatial_sig: Optional[np.ndarray] = None,
+    ) -> int:
         """
         Camera A local track update.
         v7에서는 새 local ID가 등장해도 바로 새 GID를 만들지 않고, 기존 Global ID memory와 먼저 비교한다.
@@ -812,6 +903,8 @@ class Gallery:
         self.store_a.update(local_id, feat, frame_idx)
         if attrs is not None:
             self.attr_a.update(local_id, attrs, frame_idx)
+        if spatial_sig is not None:
+            self.spatial_a.update(local_id, spatial_sig, frame_idx)
 
         if local_id in self.a_gid:
             gid = self.a_gid[local_id]
@@ -822,7 +915,7 @@ class Gallery:
             self.a_gid[local_id] = gid
             self.gid_owner_a[gid] = local_id
 
-        self._update_gid_memory(gid, feat, frame_idx, "A", attrs=attrs)
+        self._update_gid_memory(gid, feat, frame_idx, "A", attrs=attrs, spatial_sig=spatial_sig)
         return gid
 
     def _update_current_assignment(self, b_lid: int, latest_best_gid: Optional[int] = None):
@@ -858,7 +951,14 @@ class Gallery:
 
         self._try_assign_gid(b_lid, best_gid)
 
-    def update_cam_b_and_match(self, local_id: int, feat: np.ndarray, frame_idx: int, attrs: Optional[np.ndarray] = None) -> Tuple[int, Optional[float]]:
+    def update_cam_b_and_match(
+        self,
+        local_id: int,
+        feat: np.ndarray,
+        frame_idx: int,
+        attrs: Optional[np.ndarray] = None,
+        spatial_sig: Optional[np.ndarray] = None,
+    ) -> Tuple[int, Optional[float]]:
         """
         Camera B local track update and match against Global ID memory.
         새 B local ID는 바로 새 양수 GID를 만들지 않고 TMP로 시작한다.
@@ -867,6 +967,8 @@ class Gallery:
         self.store_b.update(local_id, feat, frame_idx)
         if attrs is not None:
             self.attr_b.update(local_id, attrs, frame_idx)
+        if spatial_sig is not None:
+            self.spatial_b.update(local_id, spatial_sig, frame_idx)
         self._decay_evidence(local_id)
 
         if self.store_b.count(local_id) < self.min_features_to_match:
@@ -896,7 +998,7 @@ class Gallery:
         # 너무 이른 오매칭 feature가 archive를 오염시키는 것을 막기 위한 조건이다.
         if gid is not None and gid >= 0:
             if self.b_hits[local_id].get(gid, 0) >= self.confirm_count and self.b_evidence[local_id].get(gid, 0.0) >= self.min_evidence:
-                self._update_gid_memory(gid, feat, frame_idx, "B", attrs=attrs)
+                self._update_gid_memory(gid, feat, frame_idx, "B", attrs=attrs, spatial_sig=spatial_sig)
 
         return gid, best_dist
 
@@ -913,6 +1015,9 @@ class Gallery:
         self.attr_a.expire(frame_idx, self.max_age)
         self.attr_b.expire(frame_idx, self.max_age)
         self.attr_gid.expire(frame_idx, self.memory_max_age)
+        self.spatial_a.expire(frame_idx, self.max_age)
+        self.spatial_b.expire(frame_idx, self.max_age)
+        self.spatial_gid.expire(frame_idx, self.memory_max_age)
 
         valid_a = set(self.store_a.keys())
         valid_b = set(self.store_b.keys())
@@ -1016,6 +1121,45 @@ def filter_small_detections(
         if area >= min_area:
             filtered.append(det)
     return filtered
+
+
+def compute_distance_ratio_signatures(
+    detections: List[Tuple[int, int, int, int, int, float]],
+    k: int = DIST_RATIO_K,
+    min_neighbors: int = DIST_RATIO_MIN_NEIGHBORS,
+    eps: float = DIST_RATIO_EPS,
+) -> Dict[int, np.ndarray]:
+    """같은 프레임 내 상대 거리 비율 signature를 계산한다."""
+    if k <= 0:
+        return {}
+    points: Dict[int, Tuple[float, float]] = {}
+    for (lid, x1, y1, x2, y2, _conf) in detections:
+        cx = (x1 + x2) * 0.5
+        cy = float(y2)
+        points[int(lid)] = (float(cx), float(cy))
+
+    lids = list(points.keys())
+    if len(lids) < min_neighbors + 1:
+        return {}
+
+    sigs: Dict[int, np.ndarray] = {}
+    for lid in lids:
+        px, py = points[lid]
+        dists = []
+        for other in lids:
+            if other == lid:
+                continue
+            ox, oy = points[other]
+            dists.append(np.hypot(px - ox, py - oy))
+        dists = [d for d in dists if d > eps]
+        if len(dists) < min_neighbors:
+            continue
+        dists.sort()
+        kk = min(k, len(dists))
+        base = max(dists[0], eps)
+        ratios = np.asarray(dists[:kk], dtype=np.float32) / float(base)
+        sigs[lid] = ratios
+    return sigs
 
 
 def valid_crop(
@@ -1249,6 +1393,11 @@ def run(
     attr_model_name: str = ATTR_MODEL_NAME,
     attr_model_pretrained: str = ATTR_MODEL_PRETRAINED,
     osnet_model: str = OSNET_MODEL,
+    dist_ratio_enabled: bool = DIST_RATIO_ENABLED,
+    dist_ratio_weight: float = DIST_RATIO_WEIGHT,
+    dist_ratio_k: int = DIST_RATIO_K,
+    dist_ratio_min_neighbors: int = DIST_RATIO_MIN_NEIGHBORS,
+    dist_ratio_sigma: float = DIST_RATIO_SIGMA,
 ):
     global MATCH_THRESHOLD
 
@@ -1266,6 +1415,11 @@ def run(
         "[INFO] Attributes : "
         f"enabled={attr_enabled}, weight={attr_weight:.2f}, hard_filter={attr_hard_filter}, "
         f"hard_conf={attr_hard_conf:.2f}, hard_margin={attr_hard_margin:.2f}"
+    )
+    print(
+        "[INFO] Distance-ratio : "
+        f"enabled={dist_ratio_enabled}, weight={dist_ratio_weight:.2f}, k={dist_ratio_k}, "
+        f"min_neighbors={dist_ratio_min_neighbors}, sigma={dist_ratio_sigma:.2f}"
     )
     print(f"[INFO] Evidence : confirm={confirm_count}, decay={evidence_decay}, min={min_evidence}, ev_margin={evidence_margin}, switch_margin={switch_margin}, dist_margin={distance_margin}")
     print(f"[INFO] Occlusion-aware update : {'ON' if skip_occluded_update else 'OFF'}, occ_iou={occ_iou}, edge_margin={edge_margin}, aspect=[{min_aspect}, {max_aspect}]")
@@ -1305,6 +1459,9 @@ def run(
         attr_hard_filter=attr_hard_filter,
         attr_hard_conf=attr_hard_conf,
         attr_hard_margin=attr_hard_margin,
+        dist_ratio_enabled=dist_ratio_enabled,
+        dist_ratio_weight=dist_ratio_weight,
+        dist_ratio_sigma=dist_ratio_sigma,
         confirm_count=confirm_count,
         evidence_decay=evidence_decay,
         min_evidence=min_evidence,
@@ -1366,6 +1523,9 @@ def run(
             dets_a = tracker_a.update(frame_a)
             dets_a = filter_small_detections(dets_a, min_det_area)
             occluded_a = find_occluded_track_ids(dets_a, occ_iou) if skip_occluded_update else set()
+            spatial_a = {}
+            if is_feature_frame and dist_ratio_enabled:
+                spatial_a = compute_distance_ratio_signatures(dets_a, dist_ratio_k, dist_ratio_min_neighbors)
             for (lid, x1, y1, x2, y2, conf) in dets_a:
                 if is_feature_frame and lid not in occluded_a:
                     crop = valid_crop(frame_a, x1, y1, x2, y2, conf, edge_margin, min_aspect, max_aspect)
@@ -1375,7 +1535,7 @@ def run(
                         if feat is not None:
                             if norm_a is not None:
                                 feat = norm_a.normalize(feat, update=True)
-                            gid = gallery.update_cam_a(lid, feat, frame_idx, attrs=attrs)
+                            gid = gallery.update_cam_a(lid, feat, frame_idx, attrs=attrs, spatial_sig=spatial_a.get(lid))
                         else:
                             gid = gallery.get_gid(lid, "A")
                     else:
@@ -1392,6 +1552,9 @@ def run(
             dets_b = tracker_b.update(frame_b)
             dets_b = filter_small_detections(dets_b, min_det_area)
             occluded_b = find_occluded_track_ids(dets_b, occ_iou) if skip_occluded_update else set()
+            spatial_b = {}
+            if is_feature_frame and dist_ratio_enabled:
+                spatial_b = compute_distance_ratio_signatures(dets_b, dist_ratio_k, dist_ratio_min_neighbors)
             for (lid, x1, y1, x2, y2, conf) in dets_b:
                 if is_feature_frame and lid not in occluded_b:
                     crop = valid_crop(frame_b, x1, y1, x2, y2, conf, edge_margin, min_aspect, max_aspect)
@@ -1401,7 +1564,13 @@ def run(
                         if feat is not None:
                             if norm_b is not None:
                                 feat = norm_b.normalize(feat, update=True)
-                            gid, _best_dist = gallery.update_cam_b_and_match(lid, feat, frame_idx, attrs=attrs)
+                            gid, _best_dist = gallery.update_cam_b_and_match(
+                                lid,
+                                feat,
+                                frame_idx,
+                                attrs=attrs,
+                                spatial_sig=spatial_b.get(lid),
+                            )
                         else:
                             gid = gallery.get_gid(lid, "B")
                     else:
@@ -1505,6 +1674,11 @@ if __name__ == "__main__":
     parser.add_argument("--attr_hard_margin", type=float, default=ATTR_HARD_MARGIN, help=f"attribute hard-filter 차이 margin (기본: {ATTR_HARD_MARGIN})")
     parser.add_argument("--attr_model", default=ATTR_MODEL_NAME, help=f"CLIP model name (기본: {ATTR_MODEL_NAME})")
     parser.add_argument("--attr_pretrained", default=ATTR_MODEL_PRETRAINED, help=f"CLIP pretrained tag (기본: {ATTR_MODEL_PRETRAINED})")
+    parser.add_argument("--no_dist_ratio", action="store_true", help="거리 비율 기반 spatial weighting을 비활성화합니다.")
+    parser.add_argument("--dist_ratio_weight", type=float, default=DIST_RATIO_WEIGHT, help=f"거리 비율 similarity 가중치 (기본: {DIST_RATIO_WEIGHT})")
+    parser.add_argument("--dist_ratio_k", type=int, default=DIST_RATIO_K, help=f"거리 비율 signature에 사용할 이웃 수 (기본: {DIST_RATIO_K})")
+    parser.add_argument("--dist_ratio_min_neighbors", type=int, default=DIST_RATIO_MIN_NEIGHBORS, help=f"signature 계산에 필요한 최소 이웃 수 (기본: {DIST_RATIO_MIN_NEIGHBORS})")
+    parser.add_argument("--dist_ratio_sigma", type=float, default=DIST_RATIO_SIGMA, help=f"거리 비율 similarity 스케일 (기본: {DIST_RATIO_SIGMA})")
     parser.add_argument(
         "--osnet_model",
         default=OSNET_MODEL,
@@ -1571,6 +1745,11 @@ if __name__ == "__main__":
                 attr_model_name=args.attr_model,
                 attr_model_pretrained=args.attr_pretrained,
                 osnet_model=args.osnet_model,
+                dist_ratio_enabled=not args.no_dist_ratio,
+                dist_ratio_weight=args.dist_ratio_weight,
+                dist_ratio_k=args.dist_ratio_k,
+                dist_ratio_min_neighbors=args.dist_ratio_min_neighbors,
+                dist_ratio_sigma=args.dist_ratio_sigma,
             )
 
         print(f"\n[INFO] 전체 {len(pairs)}쌍 처리 완료.")
@@ -1612,4 +1791,9 @@ if __name__ == "__main__":
             attr_model_name=args.attr_model,
             attr_model_pretrained=args.attr_pretrained,
             osnet_model=args.osnet_model,
+            dist_ratio_enabled=not args.no_dist_ratio,
+            dist_ratio_weight=args.dist_ratio_weight,
+            dist_ratio_k=args.dist_ratio_k,
+            dist_ratio_min_neighbors=args.dist_ratio_min_neighbors,
+            dist_ratio_sigma=args.dist_ratio_sigma,
         )
