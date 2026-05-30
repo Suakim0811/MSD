@@ -14,12 +14,12 @@ ultralytics>=8.3.0          # YOLOv8n + ByteTrack 내장
 # CLIP은 PyPI 미등록 → git으로 설치 (아래 별도 명령 참고)
 ftfy==6.2.0                 # CLIP 내부 텍스트 정규화
 regex==2024.5.15            # CLIP 의존성
-tqdm==4.66.4                # 진행바
+tqdm>=4.67.0                # 진행바
 
 # Computer Vision
 opencv-python==4.10.0.84
 Pillow==10.3.0
 
 # Math / Matching
-scipy==1.13.0
+scipy>=1.14.1
 numpy>=2.0.0
