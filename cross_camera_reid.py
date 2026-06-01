@@ -49,6 +49,7 @@ OSNET_MODEL = "osnet_ain_x1_0"
 OSNET_WEIGHTS = "market1501"  # Re-ID pretrained weights
 OSNET_HF_REPO = "MYerassyl/retail-heat-osnet"
 OSNET_HF_FILENAMES = {
+    ("osnet_ain_x1_0", "market1501"): "osnet_ain_x1_0_market1501.pth",
     ("osnet_x1_0", "market1501"): "osnet_x1_0_market1501.pth",
     ("osnet_x1_5", "market1501"): "osnet_x1_5_market1501.pth",
     ("osnet_x2_0", "market1501"): "osnet_x2_0_market1501.pth",
@@ -223,6 +224,8 @@ def resolve_osnet_hf_filename(model_name: str, weights: str) -> str:
     filename = OSNET_HF_FILENAMES.get((model_name, weights))
     if filename:
         return filename
+    if model_name and weights:
+        return f"{model_name}_{weights}.pth"
     return OSNET_HF_FILENAMES.get((OSNET_MODEL, OSNET_WEIGHTS), "")
 
 
