@@ -250,21 +250,8 @@ class OSNetExtractor:
         # FeatureExtractor는 내부에서 resize / normalize / forward를 처리한다.
         # 중요: model_path를 비워두면 ImageNet pretrained만 로드될 수 있어서
         # person Re-ID에는 약하다. 가능하면 Market1501 Re-ID weight를 사용한다.
+        # Use torchreid built-in weights (no external download).
         model_path = ""
-        try:
-            from huggingface_hub import hf_hub_download
-            hf_filename = resolve_osnet_hf_filename(model_name, weights)
-            if not hf_filename:
-                raise ValueError("No HuggingFace filename mapping for OSNet model/weights.")
-            model_path = hf_hub_download(
-                repo_id=OSNET_HF_REPO,
-                filename=hf_filename,
-            )
-            print(f"[INFO] OSNet Re-ID weights : {model_path}")
-        except Exception as e:
-            print("[WARN] Could not download OSNet Market1501 weights.")
-            print("[WARN] Falling back to torchreid default weights. Accuracy may be lower.")
-            print(f"[WARN] Reason: {e}")
 
         self.extractor = FeatureExtractor(
             model_name=model_name,
