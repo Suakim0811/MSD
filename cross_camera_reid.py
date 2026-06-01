@@ -62,7 +62,7 @@ ATTR_MODEL_PRETRAINED = "openai"
 ATTR_HARD_FILTER = True
 ATTR_HARD_CONF = 0.60
 ATTR_HARD_MARGIN = 0.25
-ATTR_WEIGHT = 0.25
+ATTR_WEIGHT = 0.15
 ATTRIBUTES = [
     "backpack",
     "hat",
@@ -534,7 +534,16 @@ class SpatialSignatureStore:
         buf = self.buffers.get(key)
         if not buf:
             return None
-        mean_sig = np.mean(np.stack(list(buf), axis=0), axis=0)
+        # Signatures can vary in length depending on neighbor count per frame.
+        # Truncate to the shortest length to keep shapes consistent.
+        valid = [sig for sig in buf if isinstance(sig, np.ndarray) and sig.ndim == 1 and sig.size > 0]
+        if not valid:
+            return None
+        min_len = min(sig.size for sig in valid)
+        if min_len <= 0:
+            return None
+        aligned = [sig[:min_len] for sig in valid]
+        mean_sig = np.mean(np.stack(aligned, axis=0), axis=0)
         return mean_sig.astype(np.float32)
 
     def count(self, key: Union[int, str]) -> int:
